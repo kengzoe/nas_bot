@@ -40,7 +40,7 @@ def fetch_real_candles():
     now = datetime.now().timestamp()
     if cached_candles and (now - last_fetch_time) < 60:
         return cached_candles
-    url = f"https://api.twelvedata.com/time_series?symbol=NDX&interval={TIMEFRAME}&outputsize=30&apikey={TWELVE_DATA_KEY}"
+    url = f"https://api.twelvedata.com/time_series?symbol=IXIC&interval={TIMEFRAME}&outputsize=30&apikey={TWELVE_DATA_KEY}"
     try:
         res = requests.get(url, timeout=10)
         data = res.json()
