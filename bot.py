@@ -40,26 +40,39 @@ def fetch_real_candles():
     now = datetime.now().timestamp()
     if cached_candles and (now - last_fetch_time) < 60:
         return cached_candles
-    url = f"https://api.twelvedata.com/time_series?symbol=IXIC&interval={TIMEFRAME}&outputsize=30&apikey={TWELVE_DATA_KEY}"
+
+    # Using Yahoo Finance – free and works with NASDAQ
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENDX?interval=15m&range=1d"
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, headers=headers, timeout=10)
         data = res.json()
-        if data.get("status") == "ok" and "values" in data:
-            candles = []
-            for bar in reversed(data["values"]):
+        result = data["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        opens = result["indicators"]["quote"][0]["open"]
+        highs = result["indicators"]["quote"][0]["high"]
+        lows = result["indicators"]["quote"][0]["low"]
+        closes = result["indicators"]["quote"][0]["close"]
+
+        candles = []
+        for i in range(len(timestamps)):
+            if opens[i] is not None and closes[i] is not None:
                 candles.append({
-                    "open": float(bar["open"]),
-                    "high": float(bar["high"]),
-                    "low": float(bar["low"]),
-                    "close": float(bar["close"]),
-                    "date": bar["datetime"]
+                    "open": opens[i],
+                    "high": highs[i] if highs[i] else opens[i],
+                    "low": lows[i] if lows[i] else closes[i],
+                    "close": closes[i],
+                    "date": datetime.fromtimestamp(timestamps[i], timezone.utc).strftime("%Y-%m-%d %H:%M")
                 })
-            cached_candles = candles
+        if candles:
+            cached_candles = candles[-30:]    # keep last 30
             last_fetch_time = now
-            logger.info(f"Fetched {len(candles)} {TIMEFRAME} NDX candles. Price: ${candles[-1]['close']:.2f}")
-            return candles
+            logger.info(f"Yahoo: fetched {len(cached_candles)} NDX candles. Price: ${cached_candles[-1]['close']:.2f}")
+            return cached_candles
+        else:
+            logger.warning("Yahoo returned no candles")
     except Exception as e:
-        logger.error(f"API error: {e}")
+        logger.error(f"Yahoo error: {e}")
     return cached_candles
 
 def calculate_atr(candles, period=14):
