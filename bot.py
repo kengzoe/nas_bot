@@ -1,7 +1,7 @@
-# NASDAQ Bot – 15min, Yahoo Finance, BOS, S/R Bounce, Candle Patterns
+# NASDAQ Bot – 15min, MTF (4H+1H), Yahoo Finance, No Chart, No Buttons, No Daily Bias
 import encodings.idna
-import os, logging, requests, threading, numpy as np
-from datetime import datetime, timezone
+import os, logging, requests, threading, numpy as np, asyncio
+from datetime import datetime, timezone, timedelta, time
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -10,10 +10,9 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")   # not used, but kept for compatibility
+TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "")   # optional for MTF
 CHAT_ID, RUN_SIGNALS = None, False
 
-# ===== CONFIG =====
 SYMBOL = "NASDAQ100"
 TIMEFRAME = "15min"
 PRICE_INTERVAL_SECONDS = 900
@@ -25,14 +24,14 @@ ACTIVE_POSITIONS = []
 STATS = {"total_signals":0,"tp1_hits":0,"tp2_hits":0,"sl_hits":0,"daily_losses":0}
 SIGNAL_HISTORY = []
 
-FREE_CHANNEL_ID = -1004410090098      # @XAU_EDGE (same as gold/BTC) or your new forex/oil channel
+FREE_CHANNEL_ID = -1004410090098      # @XAU_EDGE or your forex channel
 VIP_CHANNEL_ID = -1004416190238
 HISTORY_CHANNEL_ID = FREE_CHANNEL_ID
 
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "NASDAQ Bot (15min Yahoo) is running!"
+    return "NASDAQ Bot (15min MTF) is running!"
 
 cached_candles = []
 last_fetch_time = 0
@@ -43,7 +42,7 @@ def fetch_real_candles():
     if cached_candles and (now - last_fetch_time) < 60:
         return cached_candles
 
-    # Yahoo Finance – ^NDX (NASDAQ-100)
+    # Yahoo Finance for ^NDX
     url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENDX?interval=15m&range=1d"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -67,9 +66,9 @@ def fetch_real_candles():
                     "date": datetime.fromtimestamp(timestamps[i], timezone.utc).strftime("%Y-%m-%d %H:%M")
                 })
         if candles:
-            cached_candles = candles[-30:]    # keep last 30
+            cached_candles = candles[-30:]
             last_fetch_time = now
-            logger.info(f"Yahoo: fetched {len(cached_candles)} NDX candles. Price: ${cached_candles[-1]['close']:.2f}")
+            logger.info(f"Yahoo: fetched {len(cached_candles)} NDX candles. Price: {cached_candles[-1]['close']:.2f}")
             return cached_candles
         else:
             logger.warning("Yahoo returned no candles")
@@ -77,7 +76,44 @@ def fetch_real_candles():
         logger.error(f"Yahoo error: {e}")
     return cached_candles
 
-# ===== Indicators & Detection (identical to gold) =====
+# ---------- MTF Helpers (try Twelve Data, fallback gracefully) ----------
+def fetch_tf_candles_twelve(symbol, interval="4h", outputsize=20):
+    """Fetch higher timeframe candles from Twelve Data if key is set."""
+    if not TWELVE_DATA_KEY:
+        return []
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_KEY}"
+    try:
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if data.get("status") == "ok" and "values" in data:
+            candles = []
+            for bar in reversed(data["values"]):
+                candles.append({
+                    "open": float(bar["open"]),
+                    "high": float(bar["high"]),
+                    "low": float(bar["low"]),
+                    "close": float(bar["close"]),
+                    "date": bar["datetime"]
+                })
+            return candles
+    except:
+        pass
+    return []
+
+def tf_trend(candles):
+    if len(candles) < 20:
+        return None
+    closes = [c["close"] for c in candles]
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    current = closes[-1]
+    if ema20 > ema50 and current > ema20:
+        return "BULLISH"
+    elif ema20 < ema50 and current < ema20:
+        return "BEARISH"
+    return None
+
+# ---------- Indicators & SMC Detection (identical to other bots) ----------
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return MIN_STOP_POINTS
@@ -200,6 +236,7 @@ def detect_sr_bounce(candles, atr):
         return "RESISTANCE", "SELL"
     return None, None
 
+# ---------- Signal Engine with MTF ----------
 def process_signals():
     global RISK_REWARD_MULTIPLIER, STATS
     candles = fetch_real_candles()
@@ -223,6 +260,12 @@ def process_signals():
     bos = detect_bos(candles)
     sr_type, sr_signal = detect_sr_bounce(candles, atr)
 
+    # ===== MTF (try Twelve Data, fallback gracefully) =====
+    h4_candles = fetch_tf_candles_twelve("NDX", "4h", 20)   # try Twelve Data
+    h1_candles = fetch_tf_candles_twelve("NDX", "1h", 20)
+    h4_trend = tf_trend(h4_candles) if h4_candles else None
+    h1_trend = tf_trend(h1_candles) if h1_candles else None
+
     sig, reason, grade, score_val = None, "", "C", 0
 
     # BUY
@@ -243,6 +286,12 @@ def process_signals():
         elif pattern_name == "Doji" and trend_up: score += 10; reasons.append("Doji+Trend↑")
         if bos == "BULLISH": score += 20; reasons.append("BOS↑")
         if sr_type == "SUPPORT": score += 15; reasons.append("SupportBounce")
+
+        # ----- MTF Bonus -----
+        if h4_trend == "BULLISH":
+            score += 15; reasons.append("4H✅")
+        if h1_trend == "BULLISH":
+            score += 10; reasons.append("1H✅")
 
         if score >= 55:
             stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
@@ -272,6 +321,12 @@ def process_signals():
         if bos == "BEARISH": score += 20; reasons.append("BOS↓")
         if sr_type == "RESISTANCE": score += 15; reasons.append("ResistanceReject")
 
+        # ----- MTF Bonus -----
+        if h4_trend == "BEARISH":
+            score += 15; reasons.append("4H✅")
+        if h1_trend == "BEARISH":
+            score += 10; reasons.append("1H✅")
+
         if score >= 55:
             stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
             sig = "SELL"; reason = " + ".join(reasons) + f" | ATR:{atr:.2f}"
@@ -287,6 +342,7 @@ def process_signals():
                 "status":"PENDING","grade":grade,"score":score_val}
     return None
 
+# ---------- Monitor & Signal Loop (plain text) ----------
 async def monitor_positions(bot, price):
     global ACTIVE_POSITIONS, CHAT_ID, STATS, SIGNAL_HISTORY
     surv = []
@@ -344,12 +400,30 @@ async def signal_loop(context: ContextTypes.DEFAULT_TYPE):
             ACTIVE_POSITIONS.append(sig)
             grade = sig.get("grade","C"); score = sig.get("score",0)
             emoji = "🟢" if sig['type']=="BUY" else "🔴"
-            vip_msg = (f"🔵 NDX {grade} {sig['type']} SIGNAL\nScore: {score}/100\n"
-                       f"Entry: ${sig['entry']:.2f}\nSL: ${sig['sl']:.2f}\nTP1: ${sig['tp1']:.2f}\nTP2: ${sig['tp2']:.2f}\n"
-                       f"Reason: {sig['reason']}\n⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n🔒 VIP Instant Signal")
-            free_msg = (f"🔵 NDX {grade} {sig['type']} SIGNAL\nScore: {score}/100\n"
-                        f"Entry: ${sig['entry']:.2f}\nSL: ${sig['sl']:.2f}\nTP1: ${sig['tp1']:.2f}\n\n⚡ Full details in VIP: /join_vip")
+
+            vip_msg = (
+                f"┌─────────────────────────────────┐\n"
+                f"│  {emoji} {sig['type']} NDX  │  {grade}  │  {score}%  │\n"
+                f"└─────────────────────────────────┘\n"
+                f"  Entry    ${sig['entry']:.2f}\n"
+                f"  SL       ${sig['sl']:.2f} ({abs(sig['entry']-sig['sl']):.1f} pts)\n"
+                f"  TP1      ${sig['tp1']:.2f} (+{abs(sig['tp1']-sig['entry']):.1f} pts)\n"
+                f"  TP2      ${sig['tp2']:.2f} (+{abs(sig['tp2']-sig['entry']):.1f} pts)\n\n"
+                f"  [{sig['reason'].replace(' | ','] [')}]\n\n"
+                f"  ⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+            )
             await context.bot.send_message(chat_id=VIP_CHANNEL_ID, text=vip_msg)
+
+            free_msg = (
+                f"┌─────────────────────────────────┐\n"
+                f"│  {emoji} {sig['type']} NDX  │  {grade}  │  {score}%  │\n"
+                f"└─────────────────────────────────┘\n"
+                f"  Entry    ${sig['entry']:.2f}\n"
+                f"  SL       ${sig['sl']:.2f}\n"
+                f"  TP1      ${sig['tp1']:.2f}\n\n"
+                f"  ⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+                f"  ⚡ Full breakdown in VIP: /join_vip"
+            )
             await context.bot.send_message(chat_id=FREE_CHANNEL_ID, text=free_msg)
             await context.bot.send_message(chat_id=CHAT_ID, text=vip_msg)
 
@@ -361,9 +435,10 @@ async def report_callback(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHAT_ID, text=f"📅 DAILY NDX\nSignals: {STATS['total_signals']}\nTP1: {STATS['tp1_hits']} TP2: {STATS['tp2_hits']}\nSL: {STATS['sl_hits']}\nWin: {wr:.1f}%")
     STATS["total_signals"]=STATS["tp1_hits"]=STATS["tp2_hits"]=STATS["sl_hits"]=STATS["daily_losses"]=0
 
+# ---------- Commands (no daily bias) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID; CHAT_ID = update.effective_chat.id
-    await update.message.reply_text("🔵 NASDAQ SMC (15min)\n/start_signals /stop_signals /status /report /history /join_vip")
+    await update.message.reply_text("🔵 NASDAQ SMC (15min MTF)\n/start_signals /stop_signals /status /report /history /join_vip")
 
 async def start_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUN_SIGNALS, CHAT_ID
@@ -372,7 +447,7 @@ async def start_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     RUN_SIGNALS = True
     context.job_queue.run_repeating(signal_loop, interval=PRICE_INTERVAL_SECONDS, name="ndx_job")
     context.job_queue.run_repeating(report_callback, interval=86400, first=86400, name="report_job")
-    await update.message.reply_text("🚀 NDX scanning started (15min)")
+    await update.message.reply_text("🚀 NDX scanner started (15min MTF)")
 
 async def stop_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUN_SIGNALS
